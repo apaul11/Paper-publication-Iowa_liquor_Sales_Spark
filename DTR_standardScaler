@@ -1,0 +1,205 @@
+
+scp sample.csv skundu@129.150.69.91:~/
+
+
+# ssh jwoo5@129.150.69.91
+# ssh skundu@129.150.69.91
+
+hdfs dfs -put sample.csv /user/skundu
+
+#== works
+# pyspark  --num-executors=16 --executor-cores=8 --executor-memory=23G
+#== Works as well
+# pyspark  --num-executors=10 --executor-cores=8 --executor-memory=23G
+
+
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from pyspark.sql.session import SparkSession
+from pyspark.sql import SQLContext
+sqlContext = SQLContext(sc)
+from pyspark.ml import Pipeline
+from pyspark.storagelevel import StorageLevel
+
+from pyspark.ml.feature import VectorAssembler, StringIndexer, VectorIndexer, MinMaxScaler, StandardScaler
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder, TrainValidationSplit
+
+from pyspark.ml.regression import DecisionTreeRegressor
+from pyspark.ml.regression import GBTRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.feature import OneHotEncoder
+from pyspark.ml.evaluation import BinaryClassificationEvaluator, RegressionEvaluator
+from pyspark.ml.classification import LogisticRegression
+
+from pyspark.sql import functions as f
+import pyspark.sql.functions as f
+import sys
+
+#csv = spark.read.csv('/user/skundu/iowa_Liquor_Sales.csv', inferSchema=True, header=True)
+
+
+csv = spark.read.csv('/user/skundu/sample.csv', inferSchema=True, header=True)
+
+
+csv.show(3)
+
+
+csv.registerTempTable("temp")
+
+
+# csv1 = sqlContext.sql("""select Pack, `Bottle Volume (ml)` as BottleVolumeInMl, `State Bottle Cost` as StateBottleCost, `State Bottle Retail` as StateBottleRetail, `Bottles Sold` as BottlesSold, `Sale (Dollars)` as SaleInDollars, `Volume Sold (Liters)` as VolumeSoldInLitres from temp""")
+csv1 = sqlContext.sql("select Pack, `Bottle Volume (ml)` as BottleVolumeInMl, `State Bottle Cost` as StateBottleCost, `State Bottle Retail` as StateBottleRetail, `Bottles Sold` as BottlesSold, `Sale (Dollars)` as SaleInDollars, `Volume Sold (Liters)` as VolumeSoldInLitres from temp")
+
+
+df1 = csv1.filter(csv1.StateBottleCost.isNotNull())
+
+df2 = df1.filter(df1.StateBottleRetail.isNotNull())
+
+df3 = df2.filter(df2.BottleVolumeInMl.isNotNull())
+
+df4 = df3.filter(df3.Pack.isNotNull())
+
+df5 = df4.filter(df4.BottlesSold.isNotNull())
+
+df6 = df5.filter(df5.SaleInDollars.isNotNull())
+
+df7 = df6.filter(df6.VolumeSoldInLitres.isNotNull())
+
+
+data = df7.select(col("Pack").cast(DoubleType()), col("BottleVolumeInMl").cast(DoubleType()), "StateBottleCost", "StateBottleRetail", col("BottlesSold").cast(DoubleType()), "VolumeSoldInLitres", col("SaleInDollars").alias("label"))
+
+# JWoo5: persist the dataframes with DISK_ONLY
+# data.persist(StorageLevel.MEMORY_AND_DISK)
+data.persist(StorageLevel.DISK_ONLY)
+
+data.show(5)
+
+
+
+splits = data.randomSplit([0.7, 0.3])
+
+train = splits[0]
+
+test = splits[1].withColumnRenamed("label", "trueLabel")
+
+# JWoo5: persist the dataframes
+train.persist(StorageLevel.DISK_ONLY)
+test.persist(StorageLevel.DISK_ONLY)
+
+print ("DTR Training Rows:", train.count(), "DTR Testing Rows:", test.count())
+
+train.show(20)
+
+
+
+
+assembler = VectorAssembler(inputCols = ["Pack", "BottleVolumeInMl","StateBottleCost", "StateBottleRetail", "BottlesSold", "VolumeSoldInLitres"], outputCol="features")
+
+temp_train = assembler.transform(train)
+
+temp_train.select("features").show(5)
+
+temp_train.show(5)
+
+temp_train.persist(StorageLevel.DISK_ONLY)
+
+
+scaler = StandardScaler(inputCol = "features" , outputCol = "scaled")
+
+
+
+dtr_train = scaler.fit(temp_train).transform(temp_train)
+
+dtr_train.show(5)
+
+dtr_train.persist(StorageLevel.DISK_ONLY)
+
+df_train = dtr_train.select("label", "scaled")
+
+df_train.show(5)
+
+df_train.persist(StorageLevel.DISK_ONLY)
+
+
+
+
+temp_test = assembler.transform(test)
+
+temp_test.select("features").show(5)
+
+temp_test.show(5)
+
+temp_test.persist(StorageLevel.DISK_ONLY)
+
+dtr_test = scaler.fit(temp_test).transform(temp_test)
+
+dtr_test.show(5)
+
+dtr_test.persist(StorageLevel.DISK_ONLY)
+
+df_test = dtr_test.select("trueLabel", "scaled")
+
+df_test.persist(StorageLevel.DISK_ONLY)
+
+
+#JWoo5: Do you need? maxBins=77582
+#dtr = DecisionTreeRegressor(featuresCol='features', labelCol='label') # maxBins=32)
+dtr = DecisionTreeRegressor(featuresCol='scaled', labelCol='label')
+
+#dtr_pipeline = Pipeline(stages=[assembler, dtr])
+dtr_pipeline = Pipeline(stages=[dtr])
+
+#paramGrid_Dtr = (ParamGridBuilder()
+              .addGrid(dtr.maxDepth,[2, 5])
+              .addGrid(dtr.minInfoGain,[0.0, 0.1, 0.2])
+              .build())
+
+
+dtparamGrid = (ParamGridBuilder()
+             .addGrid(dtr.maxDepth, [2, 5, 10, 20, 30])
+             #.addGrid(dtr.maxDepth, [2, 5, 10])
+             .addGrid(dtr.maxBins, [10, 20, 40, 80, 100])
+             #.addGrid(dtr.maxBins, [10, 20])
+             .build())
+
+
+
+#JWoo5:  TrainValidationSplit should be much faster
+
+cvDtr = CrossValidator(estimator=dtr_pipeline, evaluator=RegressionEvaluator(), estimatorParamMaps=dtparamGrid, numFolds=5)
+
+#tvsDtr = TrainValidationSplit(estimator=dtr_pipeline, estimatorParamMaps=dtparamGrid, evaluator=RegressionEvaluator(), trainRatio=0.8)
+
+
+dtr_model = cvDtr.fit(df_train)
+#dtr_model = tvsDtr.fit(df_train)
+
+
+
+#dtr_prediction = dtr_model.transform(dtr_test)
+#scaledData_prediction = scalerModel.transform(dataFrame)
+
+dtr_prediction = dtr_model.transform(df_test)
+
+#dtr_predicted = dtr_prediction.select("features", "prediction", "trueLabel")
+#scaledData_predicted = scaledData_prediction.select("features", "prediction", "trueLabel")
+
+dtr_predicted = dtr_prediction.select("scaled", "prediction", "trueLabel")
+
+
+#scaledData.show(20)
+dtr_predicted.show(20)
+
+
+dtr_evaluator = RegressionEvaluator(labelCol="trueLabel", predictionCol="prediction", metricName="rmse")
+#scaledData_evaluator = RegressionEvaluator(labelCol="trueLabel", predictionCol="prediction", metricName="rmse")
+
+
+#dtr_rmse = dtr_evaluator.evaluate(dtr_prediction)
+#rmse = scaledData_evaluator.evaluate(scaledData_prediction)
+
+dtr_rmse = dtr_evaluator.evaluate(dtr_prediction)
+
+print ("Root Mean Square Error (RMSE_DTR):", dtr_rmse)
+#print ("Root Mean Square Error (DTR):", rmse)
+
